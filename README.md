@@ -30,15 +30,15 @@ updated on demand from document events (never polled).
 
 ## Installation
 
-Copy the `GridOverlay` folder into your FreeCAD user `Mod` directory, then
-restart FreeCAD.
+Place the `GridOverlay` folder in your FreeCAD user `Mod` directory, then
+restart FreeCAD. The usual locations are:
 
-```bash
-cp -r /path/to/GridOverlay ~/.local/share/FreeCAD/Mod/
-```
+- **Windows:** `%APPDATA%\FreeCAD\Mod` (typically `C:\Users\<username>\AppData\Roaming\FreeCAD\Mod`)
+- **Linux:** `~/.local/share/FreeCAD/Mod`
+- **macOS:** `~/Library/Preferences/FreeCAD/Mod`
 
-> FreeCAD loads `Init.py` at startup; it bootstraps `InitGui.py` for the
-> legacy Mod-folder layout, so no manual GUI activation is needed.
+Some FreeCAD builds use a version-specific user directory; in that case, use
+the `Mod` folder inside that directory.
 
 ## Usage
 
