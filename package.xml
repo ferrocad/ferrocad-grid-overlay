@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>Grid Overlay</name>
+  <version>1.0.0</version>
+  <date>2026-10-13</date>
+  <description>Procedural viewport grid with optional ground shadows.</description>
+  <maintainer email="makzumi@gmail.com">makzumi</maintainer>
+  <license file="LICENSE">MIT</license>
+  <icon>Resources/grid.svg</icon>
+  <url type="repository" branch="main">https://github.com/makzumi/freecad-grid-overlay</url>
+  <url type="readme">https://raw.githubusercontent.com/makzumi/freecad-grid-overlay/main/README.md</url>
+  <tag>grid</tag>
+  <tag>viewport</tag>
+  <tag>extension</tag>
+
+  <content>
+    <other>
+      <name>Grid Overlay</name>
+      <description>Global toolbar command that configures a procedural viewport grid.</description>
+      <subdirectory>./</subdirectory>
+    </other>
+  </content>
+</package>

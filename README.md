@@ -1,6 +1,6 @@
 # Grid Overlay for FreeCAD
 
-![Grid Overlay demo](assets/demo.png)
+![Grid Overlay demo](https://raw.githubusercontent.com/makzumi/freecad-grid-overlay/main/Resources/Media/demo.png)
 
 A lightweight, procedural grid overlay for the FreeCAD 3D viewport. The grid is
 drawn by a Coin3D/GLSL shader on a single full-screen quad — the fragment
