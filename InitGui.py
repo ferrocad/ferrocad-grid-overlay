@@ -14,27 +14,44 @@ import FreeCAD as App
 import FreeCADGui as Gui
 from pivy import coin
 
-QtCore = QtGui = QtWidgets = Signal = None
-try:
-    QtCore = importlib.import_module("PySide.QtCore")
-    QtGui = importlib.import_module("PySide.QtGui")
-    QtWidgets = QtGui
-    Signal = QtCore.Signal
-except Exception:
-    try:
-        QtCore = importlib.import_module("PySide2.QtCore")
-        QtGui = importlib.import_module("PySide2.QtGui")
-        QtWidgets = importlib.import_module("PySide2.QtWidgets")
-        Signal = QtCore.Signal
-    except Exception:
+# FreeCAD's directory-module loader executes this file inside a function. Make
+# the imports needed by helper functions visible in the module globals before
+# calling those helpers during startup.
+globals().update({"App": App, "importlib": importlib})
+
+
+def _load_qt():
+    """Load the Qt binding exposed by FreeCAD, across 26.x and 27.x.
+
+    ``PySide`` is FreeCAD's compatibility module and is intentionally tried
+    first.  Some 26.x installations expose PySide2 while newer builds expose
+    PySide6, so keep the concrete bindings as fallbacks rather than assuming a
+    particular Qt major version.
+    """
+    errors = []
+    for binding in ("PySide", "PySide2", "PySide6"):
         try:
-            QtCore = importlib.import_module("PySide6.QtCore")
-            QtGui = importlib.import_module("PySide6.QtGui")
-            QtWidgets = importlib.import_module("PySide6.QtWidgets")
-            Signal = QtCore.Signal
+            core = importlib.import_module(binding + ".QtCore")
+            gui = importlib.import_module(binding + ".QtGui")
+            try:
+                widgets = importlib.import_module(binding + ".QtWidgets")
+            except Exception:
+                # FreeCAD's PySide compatibility module exposes widgets from
+                # QtGui, as used by some older builds.
+                widgets = gui
+            return core, gui, widgets, core.Signal
         except Exception as exc:
-            App.Console.PrintError("Grid Overlay: Qt import failed: %r\n" % (exc,))
-            raise
+            errors.append("%s: %s" % (binding, exc))
+    message = "Grid Overlay: Qt import failed (%s)\n" % "; ".join(errors)
+    App.Console.PrintError(message)
+    raise ImportError(message)
+
+
+QtCore, QtGui, QtWidgets, Signal = _load_qt()
+globals().update({
+    "QtCore": QtCore, "QtGui": QtGui, "QtWidgets": QtWidgets,
+    "Signal": Signal,
+})
 
 try:
     ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,7 +59,57 @@ except NameError:
     # FreeCAD evaluates InitGui.py with exec(), without defining __file__.
     ADDON_DIR = os.path.join(App.getUserAppDataDir(), "Mod", "GridOverlay")
 SETTINGS = QtCore.QSettings("GridOverlay", "GridOverlay")
-MANAGER_VERSION = 27
+MANAGER_VERSION = 28
+
+
+def _freecad_major_version():
+    """Return FreeCAD's major release number, or ``None`` if unavailable."""
+    try:
+        version = App.Version()
+        if isinstance(version, (tuple, list)):
+            version = version[0]
+        return int(str(version).split(".", 1)[0])
+    except Exception:
+        return None
+
+
+FREECAD_MAJOR_VERSION = _freecad_major_version()
+SUPPORTED_FREECAD_MAJOR_VERSIONS = (26, 27)
+if (FREECAD_MAJOR_VERSION is not None and
+        FREECAD_MAJOR_VERSION not in SUPPORTED_FREECAD_MAJOR_VERSIONS):
+    App.Console.PrintWarning(
+        "Grid Overlay: validated for FreeCAD 26.x and 27.x; detected %s.x\n"
+        % FREECAD_MAJOR_VERSION)
+
+
+def _qt_enum(name):
+    """Read a Qt enum in both its Qt5 and Qt6 forms."""
+    value = getattr(QtCore.Qt, name, None)
+    if value is not None:
+        return value
+    scoped = getattr(QtCore.Qt, "Orientation", None)
+    if scoped is not None:
+        value = getattr(scoped, name, None)
+    if value is None:
+        raise AttributeError("Qt enum %s is unavailable" % name)
+    return value
+
+
+def _dialog_button(name):
+    """Read QDialogButtonBox flags in both Qt5 and Qt6 forms."""
+    box = QtWidgets.QDialogButtonBox
+    value = getattr(box, name, None)
+    if value is not None:
+        return value
+    scoped = getattr(box, "StandardButton", None)
+    if scoped is not None:
+        value = getattr(scoped, name, None)
+    if value is None:
+        raise AttributeError("QDialogButtonBox button %s is unavailable" % name)
+    return value
+
+
+QT_HORIZONTAL = _qt_enum("Horizontal")
 
 # FreeCAD's directory-module loader executes this file inside a function. In
 # that mode, names assigned by exec() are not visible to functions/classes
@@ -51,7 +118,8 @@ globals().update({
     "os": os, "math": math, "App": App, "Gui": Gui, "coin": coin,
     "QtCore": QtCore, "QtGui": QtGui, "QtWidgets": QtWidgets,
     "Signal": Signal, "ADDON_DIR": ADDON_DIR, "SETTINGS": SETTINGS,
-    "MANAGER_VERSION": MANAGER_VERSION,
+    "MANAGER_VERSION": MANAGER_VERSION, "QT_HORIZONTAL": QT_HORIZONTAL,
+    "_dialog_button": _dialog_button,
 })
 
 
@@ -500,17 +568,19 @@ class GridManager:
         self.schedule_shadow()
 
     def slotDeletedDocument(self, doc):
-        try:
-            self.remove_grid(doc.Document.Name)
-        except Exception:
-            pass
+        name = getattr(doc, "Name", None)
+        if name is None:
+            document = getattr(doc, "Document", None)
+            name = getattr(document, "Name", None)
+        if name is not None:
+            self.remove_grid(name)
 
     def slotChangedObject(self, vp, prop):
         name = prop if isinstance(prop, str) else getattr(prop, "Name", str(prop))
         if name in ("Visibility", "Placement"):
             self.schedule_shadow()
 
-    def slotDeletedObject(self, vp):
+    def slotDeletedObject(self, *args):
         self.schedule_shadow()
 
     # -- teardown (add-on reload) ---------------------------------------
@@ -563,21 +633,22 @@ class SettingsDialog(QtWidgets.QDialog):
         self.enabled.setChecked(setting("enabled")); form.addRow(self.enabled)
         self.shadow_enabled = QtWidgets.QCheckBox("Show ground shadow")
         self.shadow_enabled.setChecked(setting("shadow_enabled")); form.addRow(self.shadow_enabled)
-        self.shadow_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.shadow_opacity = QtWidgets.QSlider(QT_HORIZONTAL)
         self.shadow_opacity.setRange(0, 100)
         self.shadow_opacity.setValue(int(setting("shadow_opacity") * 100))
         form.addRow("Ground shadow opacity", self.shadow_opacity)
         self.spacing = QtWidgets.QDoubleSpinBox(); self.spacing.setRange(0.1, 100.0); self.spacing.setDecimals(2); self.spacing.setValue(setting("base_spacing"))
         form.addRow("Base spacing scale", self.spacing)
-        self.opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.opacity.setRange(0, 100); self.opacity.setValue(int(setting("opacity")*100))
+        self.opacity = QtWidgets.QSlider(QT_HORIZONTAL); self.opacity.setRange(0, 100); self.opacity.setValue(int(setting("opacity")*100))
         form.addRow("Opacity", self.opacity)
         self.color = QtWidgets.QPushButton("Choose color…")
         self.color_value = setting("color"); self._set_color_style()
         form.addRow("Grid color", self.color)
         self.color.clicked.connect(self.choose_color)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Apply | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = QtWidgets.QDialogButtonBox(
+            _dialog_button("Apply") | _dialog_button("Cancel"))
         layout.addWidget(buttons)
-        buttons.button(QtWidgets.QDialogButtonBox.Apply).clicked.connect(self.apply)
+        buttons.button(_dialog_button("Apply")).clicked.connect(self.apply)
         buttons.rejected.connect(self.reject)
 
     def _set_color_style(self):

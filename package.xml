@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
   <name>Grid Overlay</name>
-  <version>1.0.0</version>
-  <date>2026-10-13</date>
+  <version>1.1.0</version>
+  <date>2026-10-19</date>
   <description>Procedural viewport grid with optional ground shadows.</description>
   <maintainer email="makzumi@gmail.com">makzumi</maintainer>
   <license file="LICENSE">MIT</license>
@@ -17,6 +17,7 @@
     <other>
       <name>Grid Overlay</name>
       <description>Global toolbar command that configures a procedural viewport grid.</description>
+      <freecadmin>26.0</freecadmin>
       <subdirectory>./</subdirectory>
     </other>
   </content>

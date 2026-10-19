@@ -60,9 +60,22 @@ the shadow updates on geometry changes (debounced by 150 ms).
 
 ## Requirements
 
-- FreeCAD (tested on the 27-1 release line)
-- PySide (2 or 6) for the settings dialog
+- FreeCAD 26.x or 27.x (the current validation targets are 26.3 and 27.1)
+- FreeCAD's bundled PySide compatibility module, PySide2, or PySide6 for the
+  settings dialog
 - `pivy` (Coin3D) for the scene-graph nodes
+
+The add-on keeps its FreeCAD-facing code on APIs shared by 26.x and 27.x. At
+startup it detects the host release and warns if it is outside those validated
+major versions. Qt enum/button compatibility is handled for both Qt5-style and
+Qt6-style bindings, and the shader uses GLSL 1.20 compatibility syntax shared
+by the supported Coin3D viewport builds.
+
+For release validation, install the same add-on revision in one FreeCAD 26.x
+build and one FreeCAD 27.x build, then verify startup with and without an open
+document, open a 3D view, toggle the grid, change each setting, recompute and
+move/hide geometry, switch documents, and close/reopen the application. Check
+the FreeCAD Python console for import, shader, or observer errors.
 
 ## License
 
