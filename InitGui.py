@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Grid Overlay add-on for FreeCAD (legacy Mod-folder layout).
+"""Grid Overlay add-on: a WGSL grid shader on a Coin quad.
 
-The grid is a single full-screen quad drawn by a GLSL shader: the fragment
-shader intersects each pixel's view ray with the z=0 plane and draws
+The grid is a single full-screen quad drawn by a WGSL shader: the fragment
+stage intersects each pixel's view ray with the z=0 plane and draws
 anti-aliased, level-of-detail-blended lines. There is no per-frame Python work
 (no camera sensor, no polling timer, no geometry rebuilds).
 """
@@ -59,6 +59,10 @@ except NameError:
     # FreeCAD evaluates InitGui.py with exec(), without defining __file__.
     ADDON_DIR = os.path.join(App.getUserAppDataDir(), "Mod", "GridOverlay")
 SETTINGS = QtCore.QSettings("GridOverlay", "GridOverlay")
+
+#: The ported shader. A mod ships loose files, so it carries its own copy of the
+#: reference ``crates/ferrocad_wgpu/shaders/grid_overlay.wgsl``.
+WGSL_PATH = os.path.join(ADDON_DIR, "Resources", "grid_overlay.wgsl")
 MANAGER_VERSION = 28
 
 
@@ -212,7 +216,7 @@ globals()["_set_mf_floats"] = _set_mf_floats
 
 @_publish
 class ShaderGrid:
-    """Infinite z=0 grid drawn by a shader on a 4-vertex placeholder quad."""
+    """Infinite z=0 grid drawn by a WGSL shader on a 4-vertex placeholder quad."""
 
     # Placeholder corners. The vertex shader only uses their sign, so they can
     # be tiny: that keeps the scene bounding box (near/far clipping, view fit)
@@ -224,11 +228,16 @@ class ShaderGrid:
         self.sg = view.getSceneGraph()
         self.visible = True
 
-        shader_dir = os.path.join(ADDON_DIR, "Resources")
+        with open(WGSL_PATH, "r", encoding="utf-8") as handle:
+            self.wgsl = handle.read()
+
+        # FerroCAD's stage nodes carry WGSL **source text** (``source``), not a
+        # GLSL file path (``sourceProgram``). WGSL has no per-stage modules, so
+        # the vertex stage carries the whole file and the fragment stage stays
+        # empty: the compiler concatenates the non-empty stage sources.
         vertex = coin.SoVertexShader()
-        vertex.sourceProgram.setValue(os.path.join(shader_dir, "grid.vert.glsl"))
+        vertex.source = self.wgsl
         fragment = coin.SoFragmentShader()
-        fragment.sourceProgram.setValue(os.path.join(shader_dir, "grid.frag.glsl"))
 
         self.grid_color = coin.SoShaderParameter3f()
         self.grid_color.name = "grid_color"
@@ -307,7 +316,7 @@ class ShaderGrid:
         self.minor_alpha.value = strength * 0.35
         self.major_alpha.value = strength
 
-    SHADOW_MAX = 64          # must match SHADOW_MAX in grid.frag.glsl
+    SHADOW_MAX = 64          # must match SHADOW_MAX in grid_overlay.wgsl
     SHADOW_STRIDE = 5        # must match SHADOW_STRIDE in grid.frag.glsl
 
     @staticmethod
