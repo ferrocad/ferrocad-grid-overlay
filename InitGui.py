@@ -1,140 +1,51 @@
 # -*- coding: utf-8 -*-
-"""Grid Overlay add-on: a WGSL grid shader on a Coin quad.
+"""Grid Overlay for FerroCAD: a WGSL grid on the pull overlay bridge.
 
-The grid is a single full-screen quad drawn by a WGSL shader: the fragment
-stage intersects each pixel's view ray with the z=0 plane and draws
-anti-aliased, level-of-detail-blended lines. There is no per-frame Python work
-(no camera sensor, no polling timer, no geometry rebuilds).
+This is the Coin/shader form of the grid overlay: it builds an
+``SoSwitch``/``SoSeparator``/``SoShaderProgram``/``SoFaceSet`` tree and draws the
+ported WGSL shader on a four-vertex placeholder quad. The fragment stage
+intersects each pixel's view ray with the z=0 plane, so there is no per-frame
+Python work and no geometry to rebuild.
+
+The approach change from the upstream add-on is the **pull bridge**. There is no
+``getSceneGraph()``: the tree is handed to the shell with
+``FreeCADGui.addOverlay(root)``, which extracts it immediately, and the shell
+re-extracts it on refresh. Because ``addChild`` and ``SoMFNode`` are
+value-copied, a parameter change is followed by ``_rebind()``: the parameters
+are written back into the stage/program value nodes, the separator is rebuilt,
+and the same root switch is removed from and re-added to the bridge.
+
+There is also no Qt: the six knobs are returned as the shell's declarative
+dialog spec (``{"title", "accept", "fields", "on_accept"}``), settings live in
+``FreeCAD.ParamGet``, and per-document lifecycle uses
+``FreeCAD.addDocumentObserver``. The upstream toolbar does not exist here; the
+command is opened from the shell's command list or its settings dialog.
+
+Ground shadows are deferred: the ``shadow_count``/``shadow_opacity`` parameters
+and the 80-slot ABI block are kept, the knobs persist, but ``shadow_count`` is
+always 0 because no document-bounds producer is wired yet.
 """
+
+from __future__ import annotations
+
 import os
-import math
-import importlib
 
 import FreeCAD as App
 import FreeCADGui as Gui
-from pivy import coin
-
-# FreeCAD's directory-module loader executes this file inside a function. Make
-# the imports needed by helper functions visible in the module globals before
-# calling those helpers during startup.
-globals().update({"App": App, "importlib": importlib})
-
-
-def _load_qt():
-    """Load the Qt binding exposed by FreeCAD, across 26.x and 27.x.
-
-    ``PySide`` is FreeCAD's compatibility module and is intentionally tried
-    first.  Some 26.x installations expose PySide2 while newer builds expose
-    PySide6, so keep the concrete bindings as fallbacks rather than assuming a
-    particular Qt major version.
-    """
-    errors = []
-    for binding in ("PySide", "PySide2", "PySide6"):
-        try:
-            core = importlib.import_module(binding + ".QtCore")
-            gui = importlib.import_module(binding + ".QtGui")
-            try:
-                widgets = importlib.import_module(binding + ".QtWidgets")
-            except Exception:
-                # FreeCAD's PySide compatibility module exposes widgets from
-                # QtGui, as used by some older builds.
-                widgets = gui
-            return core, gui, widgets, core.Signal
-        except Exception as exc:
-            errors.append("%s: %s" % (binding, exc))
-    message = "Grid Overlay: Qt import failed (%s)\n" % "; ".join(errors)
-    App.Console.PrintError(message)
-    raise ImportError(message)
-
-
-QtCore, QtGui, QtWidgets, Signal = _load_qt()
-globals().update({
-    "QtCore": QtCore, "QtGui": QtGui, "QtWidgets": QtWidgets,
-    "Signal": Signal,
-})
 
 try:
-    ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    # FreeCAD evaluates InitGui.py with exec(), without defining __file__.
-    ADDON_DIR = os.path.join(App.getUserAppDataDir(), "Mod", "GridOverlay")
-SETTINGS = QtCore.QSettings("GridOverlay", "GridOverlay")
+    from pivy import coin
+except Exception as exc:  # reported by the command, never fatal at import
+    coin = None
+    _COIN_ERROR = exc
+else:
+    _COIN_ERROR = None
 
-#: The ported shader. A mod ships loose files, so it carries its own copy of the
-#: reference ``crates/ferrocad_wgpu/shaders/grid_overlay.wgsl``.
-WGSL_PATH = os.path.join(ADDON_DIR, "Resources", "grid_overlay.wgsl")
-MANAGER_VERSION = 28
+ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
+RESOURCES = os.path.join(ADDON_DIR, "Resources")
+WGSL_PATH = os.path.join(RESOURCES, "grid_overlay.wgsl")
 
-
-def _freecad_major_version():
-    """Return FreeCAD's major release number, or ``None`` if unavailable."""
-    try:
-        version = App.Version()
-        if isinstance(version, (tuple, list)):
-            version = version[0]
-        return int(str(version).split(".", 1)[0])
-    except Exception:
-        return None
-
-
-FREECAD_MAJOR_VERSION = _freecad_major_version()
-SUPPORTED_FREECAD_MAJOR_VERSIONS = (26, 27)
-if (FREECAD_MAJOR_VERSION is not None and
-        FREECAD_MAJOR_VERSION not in SUPPORTED_FREECAD_MAJOR_VERSIONS):
-    App.Console.PrintWarning(
-        "Grid Overlay: validated for FreeCAD 26.x and 27.x; detected %s.x\n"
-        % FREECAD_MAJOR_VERSION)
-
-
-def _qt_enum(name):
-    """Read a Qt enum in both its Qt5 and Qt6 forms."""
-    value = getattr(QtCore.Qt, name, None)
-    if value is not None:
-        return value
-    scoped = getattr(QtCore.Qt, "Orientation", None)
-    if scoped is not None:
-        value = getattr(scoped, name, None)
-    if value is None:
-        raise AttributeError("Qt enum %s is unavailable" % name)
-    return value
-
-
-def _dialog_button(name):
-    """Read QDialogButtonBox flags in both Qt5 and Qt6 forms."""
-    box = QtWidgets.QDialogButtonBox
-    value = getattr(box, name, None)
-    if value is not None:
-        return value
-    scoped = getattr(box, "StandardButton", None)
-    if scoped is not None:
-        value = getattr(scoped, name, None)
-    if value is None:
-        raise AttributeError("QDialogButtonBox button %s is unavailable" % name)
-    return value
-
-
-QT_HORIZONTAL = _qt_enum("Horizontal")
-
-# FreeCAD's directory-module loader executes this file inside a function. In
-# that mode, names assigned by exec() are not visible to functions/classes
-# created by the exec unless they are explicitly published to its globals.
-globals().update({
-    "os": os, "math": math, "App": App, "Gui": Gui, "coin": coin,
-    "QtCore": QtCore, "QtGui": QtGui, "QtWidgets": QtWidgets,
-    "Signal": Signal, "ADDON_DIR": ADDON_DIR, "SETTINGS": SETTINGS,
-    "MANAGER_VERSION": MANAGER_VERSION, "QT_HORIZONTAL": QT_HORIZONTAL,
-    "_dialog_button": _dialog_button,
-})
-
-
-def _publish(obj):
-    """Decorator: make a top-level def/class visible to the exec() globals."""
-    globals()[obj.__name__] = obj
-    return obj
-
-
-globals()["_publish"] = _publish
-
+#: The same six knobs and defaults as the upstream add-on.
 DEFAULTS = {
     "enabled": True,
     "opacity": 0.65,
@@ -143,36 +54,102 @@ DEFAULTS = {
     "shadow_enabled": True,
     "shadow_opacity": 0.30,
 }
-globals()["DEFAULTS"] = DEFAULTS
+
+#: One store, not two: the add-on's ``QSettings`` group becomes a parameter group.
+SETTINGS = App.ParamGet("User parameter:BaseApp/Preferences/Mod/FerroCADGridOverlay")
+
+COMMAND = "FerroCADGridOverlay_Settings"
+
+UPSTREAM_STATUS = (
+    "FerroCAD Grid Overlay (WGSL) needs FerroCAD's pull overlay bridge "
+    "(FreeCADGui.addOverlay); this build does not provide it. This mod targets "
+    "the FerroCAD API only."
+)
 
 
-@_publish
 def setting(key):
-    value = SETTINGS.value(key, DEFAULTS[key])
+    """Read one knob, clamped exactly as the upstream ``setting()`` does."""
     if key in ("enabled", "shadow_enabled"):
-        if isinstance(value, bool):
-            return value
-        return str(value).lower() in ("true", "1", "yes", "on")
-    if key in ("opacity", "shadow_opacity", "base_spacing"):
-        try:
-            result = float(value)
-        except Exception:
-            return DEFAULTS[key]
-        if key == "base_spacing":
-            return max(0.01, min(100.0, result))
-        return max(0.0, min(1.0, result))
-    return str(value)
+        return bool(SETTINGS.GetBool(key, DEFAULTS[key]))
+    if key == "color":
+        return str(SETTINGS.GetString(key, DEFAULTS[key]))
+    value = float(SETTINGS.GetFloat(key, DEFAULTS[key]))
+    if key == "base_spacing":
+        return max(0.01, min(100.0, value))
+    return max(0.0, min(1.0, value))
 
 
-@_publish
 def save_settings(values):
-    for key, value in values.items():
-        SETTINGS.setValue(key, value)
-    SETTINGS.sync()
+    """Persist the six dialog values; unknown keys are ignored."""
+    if "enabled" in values:
+        SETTINGS.SetBool("enabled", bool(values["enabled"]))
+    if "color" in values:
+        SETTINGS.SetString("color", str(values["color"]))
+    if "opacity" in values:
+        SETTINGS.SetFloat("opacity", float(values["opacity"]))
+    if "base_spacing" in values:
+        SETTINGS.SetFloat("base_spacing", float(values["base_spacing"]))
+    if "shadow_enabled" in values:
+        SETTINGS.SetBool("shadow_enabled", bool(values["shadow_enabled"]))
+    if "shadow_opacity" in values:
+        SETTINGS.SetFloat("shadow_opacity", float(values["shadow_opacity"]))
+
+
+def overlay_api():
+    """The pull bridge, or ``None`` on a build without it."""
+    if getattr(Gui, "addOverlay", None) is None:
+        return None
+    if getattr(Gui, "removeOverlay", None) is None:
+        return None
+    return Gui
+
+
+def _field(name, label, kind, value, **extra):
+    """One dialog field in the shell's spec (``docs/actions-and-tools.md`` §6)."""
+    field = {"name": name, "label": label, "kind": kind, "value": value}
+    field.update(extra)
+    return field
+
+
+def _srgb_to_linear(channel):
+    """One sRGB 0..1 channel in linear light.
+
+    The render target is sRGB, so the add-on's ``#808080`` has to be decoded
+    before it reaches the WGSL block.
+    """
+    if channel <= 0.04045:
+        return channel / 12.92
+    return ((channel + 0.055) / 1.055) ** 2.4
+
+
+def color_to_linear(text):
+    """``"#RRGGBB"`` (or ``"RRGGBB"``) as a linear RGB triple.
+
+    A malformed colour raises, so the dialog shows the error rather than silently
+    drawing the wrong ink.
+    """
+    digits = str(text).strip().lstrip("#")
+    if len(digits) != 6:
+        raise ValueError("grid colour must be a six-digit hex value (#RRGGBB)")
+    try:
+        channels = [int(digits[i : i + 2], 16) / 255.0 for i in (0, 2, 4)]
+    except ValueError as exc:
+        raise ValueError("grid colour must be a six-digit hex value (#RRGGBB)") from exc
+    return tuple(_srgb_to_linear(channel) for channel in channels)
+
+
+def _set_mf_floats(field, values):
+    """Fill an ``SoMFFloat`` from a Python list (3-arg ``setValues`` then ``setNum``)."""
+    try:
+        field.setValues(0, len(values), values)
+    except Exception:
+        for index, value in enumerate(values):
+            field.set1Value(index, value)
+    field.setNum(len(values))
 
 
 def _base_nodes():
-    """Pick-proof, unlit state shared by the grid and shadow."""
+    """Pick-proof, unlit state shared by the grid and the (deferred) shadow."""
     pick = coin.SoPickStyle()
     pick.style = coin.SoPickStyle.UNPICKABLE
     light = coin.SoLightModel()
@@ -180,64 +157,58 @@ def _base_nodes():
     return pick, light
 
 
-globals()["_base_nodes"] = _base_nodes
-
-
 def _depth_no_write():
-    """SoDepthBuffer with depth *writes* off (testing stays on), or None.
+    """``SoDepthBuffer`` with depth writes off (testing stays on), or ``None``.
 
-    Set through set(): on a node, .write is SoBase.write(), not the field.
+    Set through ``set()`` because on a node ``.write`` is ``SoBase.write()``, not
+    the field -- the upstream add-on's exact workaround.
     """
     try:
         node = coin.SoDepthBuffer()
         node.set("write FALSE")
         return node
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - one optional node is not fatal
         App.Console.PrintWarning(
-            "Grid Overlay: SoDepthBuffer unavailable: %s\n" % exc)
+            "FerroCAD Grid Overlay (WGSL): SoDepthBuffer unavailable: %s\n" % exc
+        )
         return None
 
 
-globals()["_depth_no_write"] = _depth_no_write
+def _blend_flag():
+    """The transparent-material pass flag, when the Coin surface has it.
 
-
-def _set_mf_floats(field, values):
-    """Fill an SoMFFloat from a Python list (setValues, else per element)."""
+    FerroCAD's ``SoMaterial`` has no ``transparency`` field yet, so this is
+    optional; the program pipeline blends regardless.
+    """
     try:
-        field.setValues(0, len(values), values)
-    except Exception:
-        for i, v in enumerate(values):
-            field.set1Value(i, v)
-    field.setNum(len(values))
+        flag = coin.SoMaterial()
+        flag.transparency.setValue(0.5)
+        return flag
+    except Exception:  # noqa: BLE001 - a rendering hint, not part of the contract
+        return None
 
 
-globals()["_set_mf_floats"] = _set_mf_floats
-
-
-@_publish
 class ShaderGrid:
-    """Infinite z=0 grid drawn by a WGSL shader on a 4-vertex placeholder quad."""
+    """The upstream tree: a switch holding an unlit, depth-read-only shader quad."""
 
-    # Placeholder corners. The vertex shader only uses their sign, so they can
-    # be tiny: that keeps the scene bounding box (near/far clipping, view fit)
-    # unaffected by the grid.
     _EPS = 1e-6
 
-    def __init__(self, view):
-        self.view = view
-        self.sg = view.getSceneGraph()
-        self.visible = True
+    SHADOW_MAX = 64  # must match SHADOW_MAX in grid_overlay.wgsl
+    SHADOW_STRIDE = 5  # must match SHADOW_STRIDE in grid_overlay.wgsl
+
+    def __init__(self, document_name=None):
+        self.document_name = document_name
+        self.visible = False
+        self._registered = False
 
         with open(WGSL_PATH, "r", encoding="utf-8") as handle:
             self.wgsl = handle.read()
 
-        # FerroCAD's stage nodes carry WGSL **source text** (``source``), not a
-        # GLSL file path (``sourceProgram``). WGSL has no per-stage modules, so
-        # the vertex stage carries the whole file and the fragment stage stays
-        # empty: the compiler concatenates the non-empty stage sources.
-        vertex = coin.SoVertexShader()
-        vertex.source = self.wgsl
-        fragment = coin.SoFragmentShader()
+        # A single-module WGSL file: the vertex stage carries it and the fragment
+        # stage stays empty (WGSL has no per-stage modules).
+        self.vertex = coin.SoVertexShader()
+        self.vertex.source = self.wgsl
+        self.fragment = coin.SoFragmentShader()
 
         self.grid_color = coin.SoShaderParameter3f()
         self.grid_color.name = "grid_color"
@@ -253,474 +224,336 @@ class ShaderGrid:
         self.shadow_opacity = coin.SoShaderParameter1f()
         self.shadow_opacity.name = "shadow_opacity"
         self.shadow_opacity.value = 0.0
+
+        self.parameters = [
+            self.grid_color,
+            self.base_spacing,
+            self.minor_alpha,
+            self.major_alpha,
+            self.shadow_count,
+            self.shadow_opacity,
+        ]
         self.shadow_data = None
-        self.shadow_visible = False
-        self._bounds_cache = {}
-        self._last_shadow_names = None
-        params = [self.grid_color, self.base_spacing,
-                  self.minor_alpha, self.major_alpha,
-                  self.shadow_count, self.shadow_opacity]
         try:
             self.shadow_data = coin.SoShaderParameterArray1f()
             self.shadow_data.name = "shadow_data"
-            _set_mf_floats(self.shadow_data.value,
-                           [0.0] * (self.SHADOW_MAX * self.SHADOW_STRIDE))
-            params.append(self.shadow_data)
-        except Exception as exc:
+            _set_mf_floats(
+                self.shadow_data.value,
+                [0.0] * (self.SHADOW_MAX * self.SHADOW_STRIDE),
+            )
+            self.parameters.append(self.shadow_data)
+        except Exception as exc:  # noqa: BLE001 - the shadow block is deferred
             self.shadow_data = None
             App.Console.PrintWarning(
-                "Grid Overlay: ground shadows unavailable (%s)\n" % exc)
-        fragment.parameter.setValues(0, len(params), params)
+                "FerroCAD Grid Overlay (WGSL): ground shadows unavailable (%s)\n"
+                % exc
+            )
 
-        program = coin.SoShaderProgram()
-        program.shaderObject.set1Value(0, vertex)
-        program.shaderObject.set1Value(1, fragment)
+        self.program = coin.SoShaderProgram()
+        self.program.shaderObject.set1Value(0, self.vertex)
+        self.program.shaderObject.set1Value(1, self.fragment)
 
-        e = self._EPS
-        coords = coin.SoCoordinate3()
-        coords.point.setValues(0, 4, [(-e, -e, 0), (e, -e, 0), (e, e, 0), (-e, e, 0)])
-        face = coin.SoFaceSet()
-        face.numVertices.setValue(4)
+        epsilon = self._EPS
+        self.coords = coin.SoCoordinate3()
+        self.coords.point.setValues(
+            0,
+            4,
+            [
+                (-epsilon, -epsilon, 0),
+                (epsilon, -epsilon, 0),
+                (epsilon, epsilon, 0),
+                (-epsilon, epsilon, 0),
+            ],
+        )
+        self.face = coin.SoFaceSet()
+        self.face.numVertices.setValue(4)
 
-        # A transparent material only flags the shape for the blended pass;
-        # the shader outputs its own colour and alpha.
-        flag = coin.SoMaterial()
-        flag.transparency.setValue(0.5)
+        self.depth = _depth_no_write()
+        self.flag = _blend_flag()
+
+        self.root = coin.SoSwitch()
+        for node in _base_nodes():
+            self.root.addChild(node)
+        self.root.whichChild = coin.SO_SWITCH_NONE
+        self.sep = None
+
+        self._push_parameters()
+        self._rebuild_tree()
+
+    # -- parameters -----------------------------------------------------
+    def _push_parameters(self):
+        """Write the six knobs into the shader parameter nodes."""
+        color = color_to_linear(setting("color"))
+        strength = setting("opacity")
+        self.grid_color.value = color
+        self.base_spacing.value = float(setting("base_spacing"))
+        self.minor_alpha.value = strength * 0.35
+        self.major_alpha.value = strength
+        # Shadows are deferred: the block and the loop exist, the count is zero.
+        self.shadow_count.value = 0.0
+        self.shadow_opacity.value = float(setting("shadow_opacity"))
+        if self.shadow_data is not None:
+            _set_mf_floats(
+                self.shadow_data.value,
+                [0.0] * (self.SHADOW_MAX * self.SHADOW_STRIDE),
+            )
+
+    def apply_settings(self):
+        """Push settings and re-bind. Call on change only."""
+        self._push_parameters()
+        self._rebind()
+
+    # -- the value-semantics dance --------------------------------------
+    def _rebuild_tree(self):
+        """Re-run the value-copied bindings, then refresh the switch's separator.
+
+        ``SoMFNode`` and ``SoGroup.addChild`` copy their input, so the parameter
+        nodes in ``root`` are a snapshot. Re-running the two ``set*`` calls and
+        re-adding a freshly built separator is what makes the snapshot current
+        without an arena or a live graph.
+        """
+        self.fragment.parameter.setValues(0, len(self.parameters), self.parameters)
+        self.program.shaderObject.set1Value(0, self.vertex)
+        self.program.shaderObject.set1Value(1, self.fragment)
 
         sep = coin.SoSeparator()
         # The placeholder sits at the origin; without this Coin would cull the
         # whole grid whenever the origin is off screen.
         sep.renderCulling = coin.SoSeparator.OFF
-        depth = _depth_no_write()   # blended grid must not hide the shadow
-        if depth is not None:
-            sep.addChild(depth)
-        sep.addChild(flag)
-        sep.addChild(program)
-        sep.addChild(coords)
-        sep.addChild(face)
+        for child in (self.depth, self.flag, self.program, self.coords, self.face):
+            if child is not None:
+                sep.addChild(child)
 
-        self.root = coin.SoSwitch()
-        for node in _base_nodes():
-            self.root.addChild(node)
+        if self.sep is not None:
+            self.root.removeChild(self.sep)
+        self.sep = sep
         self.root.addChild(sep)
-        self.root.whichChild = -3          # SO_SWITCH_ALL
-        self.sg.addChild(self.root)
-        self.apply_settings()
 
-    def apply_settings(self):
-        """Push settings into shader uniforms. Call on change only."""
-        color = QtGui.QColor(setting("color"))
-        strength = setting("opacity")
-        self.grid_color.value = (color.redF(), color.greenF(), color.blueF())
-        self.base_spacing.value = float(setting("base_spacing"))
-        self.minor_alpha.value = strength * 0.35
-        self.major_alpha.value = strength
+    def _bind(self):
+        Gui.addOverlay(self.root)
+        self._registered = True
 
-    SHADOW_MAX = 64          # must match SHADOW_MAX in grid_overlay.wgsl
-    SHADOW_STRIDE = 5        # must match SHADOW_STRIDE in grid.frag.glsl
+    def _unbind(self):
+        if self._registered:
+            Gui.removeOverlay(self.root)
+            self._registered = False
 
-    @staticmethod
-    def _shown(obj, depth=0):
-        """True if FreeCAD actually displays obj (own state and parents)."""
-        try:
-            vo = obj.ViewObject
-        except Exception:
-            vo = None
-        if vo is None:
-            return False
-        try:
-            if not vo.isVisible():
-                return False
-        except Exception:
-            if not vo.Visibility:
-                return False
-        if depth < 8:       # a hidden container hides its children too
-            for getter in ("getParentGeoFeatureGroup", "getParentGroup"):
-                try:
-                    parent = getattr(obj, getter)()
-                except Exception:
-                    parent = None
-                if parent is not None and not ShaderGrid._shown(parent, depth + 1):
-                    return False
-        return True
-
-    def _footprints(self):
-        """XY footprint of each visible solid-ish object.
-
-        Returns [(cx, cy, hx, hy, height, name)]. Per-object bounds are cached by
-        shape hash, so unchanged objects cost almost nothing on later updates.
-        """
-        doc = getattr(App, "ActiveDocument", None)
-        if not doc:
-            return []
-        out = []
-        seen = set()
-        for obj in getattr(doc, "Objects", []):
-            try:
-                shape = getattr(obj, "Shape", None)
-                if shape is None or shape.isNull():
-                    continue
-                if obj.isDerivedFrom("Part::Datum"):    # datum planes etc.
-                    continue
-                parent = obj.getParentGeoFeatureGroup()
-                if parent is not None and parent.isDerivedFrom("PartDesign::Body"):
-                    # Features inside a Body hold local-coordinate shapes; the
-                    # Body itself represents them in world coordinates.
-                    continue
-                if not self._shown(obj):
-                    continue
-                gp = None               # world placement for objects in a Part
-                if parent is not None:
-                    try:
-                        gp = obj.getGlobalPlacement()
-                    except Exception:
-                        gp = None
-                key = None
-                try:
-                    key = (shape.hashCode(),
-                           None if gp is None else
-                           (tuple(gp.Base), tuple(gp.Rotation.Q)))
-                except Exception:
-                    pass
-                seen.add(obj.Name)
-                cached = self._bounds_cache.get(obj.Name)
-                if key is not None and cached and cached[0] == key:
-                    bounds = cached[1]
-                else:
-                    bounds = None
-                    try:
-                        has_faces = shape.countElement("Face") > 0
-                    except Exception:
-                        has_faces = True
-                    if has_faces:       # skips sketches, wires, empty shapes
-                        if gp is not None:
-                            placed = shape.copy()
-                            placed.Placement = gp
-                            b = placed.BoundBox
-                        else:
-                            b = shape.BoundBox
-                        if b.isValid():
-                            vals = (b.XMin, b.YMin, b.ZMin, b.XMax, b.YMax, b.ZMax)
-                            if all(math.isfinite(v) and abs(v) < 1e9 for v in vals):
-                                bounds = vals
-                    if key is not None:
-                        self._bounds_cache[obj.Name] = (key, bounds)
-                if bounds is None:
-                    continue
-                x0, y0, z0, x1, y1, z1 = bounds
-                if z1 < 0.0:            # entirely below the ground plane
-                    continue
-                out.append(((x0 + x1) * 0.5, (y0 + y1) * 0.5,
-                            (x1 - x0) * 0.5, (y1 - y0) * 0.5, max(z1, 0.0),
-                            obj.Name))
-            except Exception:
-                continue
-        for name in list(self._bounds_cache):      # forget deleted objects
-            if name not in seen:
-                del self._bounds_cache[name]
-        return out
-
-    def set_shadow_visible(self, visible):
-        self.shadow_visible = bool(visible)
-        self.update_shadow()
-
-    def update_shadow(self):
-        """Rebuild the shadow slots. Event driven, never polled."""
-        if self.shadow_data is None:
+    def _rebind(self):
+        """Remove and re-add the same root after a parameter change."""
+        self._rebuild_tree()
+        if not self.visible:
+            self._unbind()
             return
-        items = self._footprints() if self.shadow_visible else []
-        if not items:
-            self.shadow_opacity.value = 0.0
-            self.shadow_count.value = 0.0
-            return
-        # Keep the largest footprints if there are more than the shader holds.
-        items.sort(key=lambda it: it[2] * it[3], reverse=True)
-        items = items[:self.SHADOW_MAX]
-        data = []
-        for cx, cy, hx, hy, height, _name in items:
-            hx = max(hx, 1e-4)
-            hy = max(hy, 1e-4)
-            blur = 0.3 * min(hx, hy) + 0.1 * height   # taller -> softer, wider
-            data.extend((cx, cy, hx, hy, blur))
-        data.extend([0.0] * (self.SHADOW_MAX * self.SHADOW_STRIDE - len(data)))
-        _set_mf_floats(self.shadow_data.value, data)
-        self.shadow_count.value = float(len(items))
-        self.shadow_opacity.value = float(setting("shadow_opacity"))
-        names = tuple(it[5] for it in items)
-        if names != self._last_shadow_names:        # Report view "Log" level
-            self._last_shadow_names = names
-            App.Console.PrintLog(
-                "Grid Overlay: ground shadows for: %s\n" % ", ".join(names))
+        self._unbind()
+        self._bind()
 
+    # -- lifecycle -------------------------------------------------------
     def set_visible(self, visible):
-        self.visible = bool(visible)
-        # Coin3D: SO_SWITCH_ALL == -3, SO_SWITCH_NONE == -1.
-        self.root.whichChild = -3 if self.visible else -1
+        """Attach or detach the switch (the upstream ``SO_SWITCH_ALL``/``NONE``)."""
+        visible = bool(visible)
+        self.visible = visible
+        self.root.whichChild = (
+            coin.SO_SWITCH_ALL if visible else coin.SO_SWITCH_NONE
+        )
+        if visible:
+            if not self._registered:
+                self._bind()
+        else:
+            self._unbind()
 
     def remove(self):
-        try:
-            self.sg.removeChild(self.root)
-        except Exception:
-            pass
+        """Detach from the bridge, if attached."""
+        self._unbind()
 
 
-@_publish
-class _AppObserver:
-    """App-level hook: geometry changed -> refresh the ground shadow."""
+class _DocumentObserver:
+    """Per-document intent: one grid for the active document.
+
+    FerroCAD exposes ``FreeCAD.addDocumentObserver`` (not the Gui variant), so
+    this lives on the App side and only reacts to document create/activate/delete.
+    """
 
     def __init__(self, manager):
         self._manager = manager
 
-    def slotRecomputedDocument(self, doc):
-        self._manager.schedule_shadow()
+    def slotCreatedDocument(self, doc):
+        self._manager.ensure_grid()
+
+    def slotActivateDocument(self, doc):
+        self._manager.ensure_grid()
+
+    def slotDeletedDocument(self, doc):
+        name = getattr(doc, "Name", None)
+        if name is not None:
+            self._manager.remove_grid(name)
 
 
-@_publish
 class GridManager:
+    """Keeps one ``ShaderGrid`` per open document; only the active one is bound."""
+
     def __init__(self):
-        self._grid_overlay_manager_version = MANAGER_VERSION
-        self.items = {}                     # doc name -> ShaderGrid
-        main = Gui.getMainWindow()
-        self.shadow_timer = QtCore.QTimer(main)
-        self.shadow_timer.setSingleShot(True)
-        self.shadow_timer.setInterval(150)
-        self.shadow_timer.timeout.connect(self.update_shadow)
+        self.items = {}
+        self._observer = _DocumentObserver(self)
+        self._observing = False
         try:
-            Gui.addDocumentObserver(self)
-        except Exception:
-            pass
-        self._app_observer = _AppObserver(self)
-        try:
-            App.addDocumentObserver(self._app_observer)
-        except Exception:
-            pass
-        # Attach when the user switches to a 3D view (e.g. from a spreadsheet).
-        try:
-            mdi = main.findChild(QtWidgets.QMdiArea)
-            if mdi is not None:
-                mdi.subWindowActivated.connect(lambda *_: self.ensure_grid())
-        except Exception:
+            App.addDocumentObserver(self._observer)
+            self._observing = True
+        except Exception:  # noqa: BLE001 - the facade may not support observers
             pass
 
-    # -- views ---------------------------------------------------------
-    @staticmethod
-    def _view():
-        try:
-            view = Gui.ActiveDocument.ActiveView
-        except Exception:
-            view = None
-        if view is None:
-            try:
-                view = Gui.activeDocument().activeView()
-            except Exception:
-                view = None
-        return view if hasattr(view, "getSceneGraph") else None
-
-    # -- grid lifecycle --------------------------------------------------
-    def ensure_grid(self, _retry=0):
+    def ensure_grid(self):
+        """Create the active document's grid when enabled, then bind it."""
         doc = getattr(App, "ActiveDocument", None)
         if doc is None:
             return
-        if setting("enabled") and doc.Name not in self.items:
-            view = self._view()
-            if view is None:
-                if _retry < 10:     # view may not exist yet during startup
-                    QtCore.QTimer.singleShot(
-                        200, lambda: self.ensure_grid(_retry + 1))
-                return
+        name = getattr(doc, "Name", None)
+        if name is None:
+            return
+        if setting("enabled") and name not in self.items:
             try:
-                grid = ShaderGrid(view)
-            except Exception as exc:
+                self.items[name] = ShaderGrid(name)
+            except Exception as exc:  # noqa: BLE001 - a broken tree is reported
                 App.Console.PrintWarning(
-                    "Grid Overlay: could not attach grid: %s\n" % exc)
+                    "FerroCAD Grid Overlay (WGSL): could not build the grid: %s\n"
+                    % exc
+                )
                 return
-            self.items[doc.Name] = grid
-        self.apply_settings()
+        self._bind_active()
+
+    def _bind_active(self):
+        """Bind only the active document's grid; detach the rest."""
+        doc = getattr(App, "ActiveDocument", None)
+        active = getattr(doc, "Name", None)
+        enabled = setting("enabled")
+        for name, grid in self.items.items():
+            grid.set_visible(bool(enabled and name == active))
 
     def apply_settings(self):
-        on = setting("enabled")
-        shadow_on = on and setting("shadow_enabled")
         for grid in self.items.values():
             grid.apply_settings()
-            grid.set_visible(on)
-            grid.set_shadow_visible(shadow_on)
+        self._bind_active()
 
     def refresh(self):
         self.ensure_grid()
+        self.apply_settings()
 
     def remove_grid(self, name=None):
         names = [name] if name is not None else list(self.items)
         for key in names:
             grid = self.items.pop(key, None)
-            if grid:
+            if grid is not None:
                 grid.remove()
 
-    # -- ground shadow (event driven) -----------------------------------
-    def schedule_shadow(self):
-        if not self.shadow_timer.isActive():
-            self.shadow_timer.start()
-
-    def update_shadow(self):
-        try:
-            grid = self.items.get(App.ActiveDocument.Name)
-            if grid:
-                grid.update_shadow()
-        except Exception as exc:
-            App.Console.PrintWarning("Grid Overlay: shadow update failed: %s\n" % exc)
-
-    # -- Gui document observer slots -------------------------------------
-    def slotCreatedDocument(self, doc):
-        QtCore.QTimer.singleShot(0, self.ensure_grid)
-
-    def slotActivateDocument(self, doc):
-        QtCore.QTimer.singleShot(0, self.ensure_grid)
-        self.schedule_shadow()
-
-    def slotDeletedDocument(self, doc):
-        name = getattr(doc, "Name", None)
-        if name is None:
-            document = getattr(doc, "Document", None)
-            name = getattr(document, "Name", None)
-        if name is not None:
-            self.remove_grid(name)
-
-    def slotChangedObject(self, vp, prop):
-        name = prop if isinstance(prop, str) else getattr(prop, "Name", str(prop))
-        if name in ("Visibility", "Placement"):
-            self.schedule_shadow()
-
-    def slotDeletedObject(self, *args):
-        self.schedule_shadow()
-
-    # -- teardown (add-on reload) ---------------------------------------
     def shutdown(self):
-        try:
-            Gui.removeDocumentObserver(self)
-        except Exception:
-            pass
-        try:
-            App.removeDocumentObserver(self._app_observer)
-        except Exception:
-            pass
-        try:
-            self.shadow_timer.stop()
-        except Exception:
-            pass
+        if self._observing:
+            try:
+                App.removeDocumentObserver(self._observer)
+            except Exception:  # noqa: BLE001 - teardown is best-effort
+                pass
+            self._observing = False
         self.remove_grid()
 
 
-manager = getattr(Gui, "_GridOverlayManager", None)
-if manager is None or getattr(manager, "_grid_overlay_manager_version", None) != MANAGER_VERSION:
-    if manager is not None:
-        try:
-            Gui.removeDocumentObserver(manager)
-        except Exception:
-            pass
-        for _fn in ("shutdown", "remove_grid"):      # new / older managers
-            try:
-                getattr(manager, _fn)()
-            except Exception:
-                pass
-        try:
-            manager.timer.stop()                      # older managers polled
-        except Exception:
-            pass
-    manager = GridManager()
-    Gui._GridOverlayManager = manager
-globals()["manager"] = manager
+def apply_dialog(values):
+    """Persist the dialog's values, re-bind, and ask the shell to redraw.
+
+    The returned ``{"view": {...}}`` is what triggers the shell to pull the
+    re-registered overlay. The flag only hides the native ground: a registered
+    overlay is drawn whether or not it is set.
+    """
+    # Validate before persisting, so a bad colour leaves the store alone.
+    if "color" in values:
+        color_to_linear(values["color"])
+    save_settings(values)
+    manager.refresh()
+    return {"view": {"grid_overlay": bool(setting("enabled"))}}
 
 
-@_publish
-class SettingsDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
-        super(SettingsDialog, self).__init__(parent or Gui.getMainWindow())
-        self.setWindowTitle("Grid Overlay Settings")
-        self.setMinimumWidth(360)
-        layout = QtWidgets.QVBoxLayout(self)
-        form = QtWidgets.QFormLayout(); layout.addLayout(form)
-        self.enabled = QtWidgets.QCheckBox("Show custom grid")
-        self.enabled.setChecked(setting("enabled")); form.addRow(self.enabled)
-        self.shadow_enabled = QtWidgets.QCheckBox("Show ground shadow")
-        self.shadow_enabled.setChecked(setting("shadow_enabled")); form.addRow(self.shadow_enabled)
-        self.shadow_opacity = QtWidgets.QSlider(QT_HORIZONTAL)
-        self.shadow_opacity.setRange(0, 100)
-        self.shadow_opacity.setValue(int(setting("shadow_opacity") * 100))
-        form.addRow("Ground shadow opacity", self.shadow_opacity)
-        self.spacing = QtWidgets.QDoubleSpinBox(); self.spacing.setRange(0.1, 100.0); self.spacing.setDecimals(2); self.spacing.setValue(setting("base_spacing"))
-        form.addRow("Base spacing scale", self.spacing)
-        self.opacity = QtWidgets.QSlider(QT_HORIZONTAL); self.opacity.setRange(0, 100); self.opacity.setValue(int(setting("opacity")*100))
-        form.addRow("Opacity", self.opacity)
-        self.color = QtWidgets.QPushButton("Choose color…")
-        self.color_value = setting("color"); self._set_color_style()
-        form.addRow("Grid color", self.color)
-        self.color.clicked.connect(self.choose_color)
-        buttons = QtWidgets.QDialogButtonBox(
-            _dialog_button("Apply") | _dialog_button("Cancel"))
-        layout.addWidget(buttons)
-        buttons.button(_dialog_button("Apply")).clicked.connect(self.apply)
-        buttons.rejected.connect(self.reject)
+class FerroCADGridOverlayCommand:
+    """``FerroCADGridOverlay_Settings`` -- configure the WGSL grid overlay."""
 
-    def _set_color_style(self):
-        self.color.setStyleSheet("background-color: %s;" % self.color_value)
-
-    def choose_color(self):
-        chosen = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.color_value), self)
-        if chosen.isValid():
-            self.color_value = chosen.name(); self._set_color_style()
-
-    def apply(self):
-        save_settings({
-            "enabled": self.enabled.isChecked(),
-            "shadow_enabled": self.shadow_enabled.isChecked(),
-            "shadow_opacity": self.shadow_opacity.value()/100.0,
-            "base_spacing": self.spacing.value(),
-            "opacity": self.opacity.value()/100.0,
-            "color": self.color_value,
-        })
-        manager.refresh()
-
-
-@_publish
-class GridOverlayCommand:
     def GetResources(self):
-        return {"MenuText": "Grid Overlay", "ToolTip": "Show or configure the custom viewport grid", "Pixmap": os.path.join(ADDON_DIR, "Resources", "grid.svg")}
+        return {
+            "MenuText": "FerroCAD Grid Overlay (WGSL)",
+            "ToolTip": "Show or configure the shader (WGSL) viewport grid",
+            "Pixmap": os.path.join(RESOURCES, "grid.svg"),
+            "Group": "View",
+            "CmdType": "ForView",
+        }
+
     def IsActive(self):
+        # Kept True so the command stays visible and can explain why it refuses
+        # to run when another grid backend is selected.
         return True
+
     def Activated(self):
-        if App.ActiveDocument and setting("enabled"):
-            manager.ensure_grid()
-        dlg = SettingsDialog()
-        (getattr(dlg, "exec", None) or dlg.exec_)()
+        if coin is None:
+            return {
+                "status": "FerroCAD Grid Overlay (WGSL) needs the Coin facade "
+                "(pivy.coin): %s" % _COIN_ERROR
+            }
+        if overlay_api() is None:
+            return {"status": UPSTREAM_STATUS}
+        manager.ensure_grid()
+        return {
+            "title": "FerroCAD Grid Overlay (WGSL) Settings",
+            "accept": "Apply",
+            "fields": [
+                _field("enabled", "Show custom grid", "bool", setting("enabled")),
+                _field("color", "Grid colour", "text", setting("color")),
+                _field(
+                    "opacity",
+                    "Opacity",
+                    "float",
+                    setting("opacity"),
+                    min=0.0,
+                    max=1.0,
+                ),
+                _field(
+                    "base_spacing",
+                    "Base spacing scale",
+                    "quantity",
+                    setting("base_spacing"),
+                    min=0.01,
+                    max=100.0,
+                ),
+                _field(
+                    "shadow_enabled",
+                    "Show ground shadow",
+                    "bool",
+                    setting("shadow_enabled"),
+                ),
+                _field(
+                    "shadow_opacity",
+                    "Ground shadow opacity",
+                    "float",
+                    setting("shadow_opacity"),
+                    min=0.0,
+                    max=1.0,
+                ),
+            ],
+            "on_accept": apply_dialog,
+        }
 
 
-Gui.addCommand("GridOverlay_Settings", GridOverlayCommand())
+_previous = getattr(Gui, "_FerroCADGridOverlayManager", None)
+if _previous is not None:
+    try:
+        _previous.shutdown()
+    except Exception:  # noqa: BLE001 - a stale manager must not block reload
+        pass
+manager = GridManager()
+Gui._FerroCADGridOverlayManager = manager
 
-# Add a toolbar to the main window so the button remains available across workbenches.
+
+# Registration is idempotent across a reload (the facade rejects a duplicate id
+# rather than overwriting it).
 try:
-    main = Gui.getMainWindow()
-    toolbar = main.findChild(QtWidgets.QToolBar, "GridOverlayToolbar")
-    if toolbar is None:
-        toolbar = QtWidgets.QToolBar("Grid Overlay")
-        toolbar.setObjectName("GridOverlayToolbar")
-        main.addToolBar(toolbar)
-    settings_action = None
-    for action in list(toolbar.actions()):
-        action_text = str(action.text())
-        if action.objectName() == "GridOverlaySettingsAction" or action_text in ("Grid Overlay", "Grid Overlay Settings"):
-            if settings_action is None:
-                settings_action = action
-        elif action.objectName() == "GridOverlayToggleAction" or action_text in ("Show/Hide", "Toggle Grid Overlay"):
-            toolbar.removeAction(action)
-    if settings_action is None:
-        settings_action = toolbar.addAction(QtGui.QIcon(os.path.join(ADDON_DIR, "Resources", "grid.svg")), "Grid Overlay")
-        settings_action.triggered.connect(lambda: Gui.runCommand("GridOverlay_Settings"))
-    settings_action.setObjectName("GridOverlaySettingsAction")
-    settings_action.setToolTip("Grid Overlay Settings")
-    toolbar.setVisible(True)
-    toolbar.show()
-except Exception as exc:
-    App.Console.PrintWarning("Grid Overlay: toolbar creation failed: %s\n" % exc)
+    Gui.removeCommand(COMMAND)
+except Exception:  # noqa: BLE001 - absent on the first load
+    pass
+Gui.addCommand(COMMAND, FerroCADGridOverlayCommand())
 
 # Attach on startup when a document is already open; otherwise wait for one.
-if setting("enabled") and App.ActiveDocument:
+if coin is not None and setting("enabled") and getattr(App, "ActiveDocument", None):
     manager.ensure_grid()
