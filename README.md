@@ -1,82 +1,149 @@
-# Grid Overlay for FreeCAD
+# FerroCAD Grid Overlay (WGSL)
 
-![Grid Overlay demo](https://raw.githubusercontent.com/makzumi/freecad-grid-overlay/main/Resources/Media/demo.png)
+![Grid Overlay demo](Resources/Media/demo.png)
 
-A lightweight, procedural grid overlay for the FreeCAD 3D viewport. The grid is
-drawn by a Coin3D/GLSL shader on a single full-screen quad — the fragment
-shader intersects each pixel's view ray with the z=0 plane and renders
-anti-aliased, level-of-detail-blended lines. There is no per-frame Python work:
-no camera sensor, no polling timer, no geometry rebuilds.
+An alternative grid backend for [FerroCAD](https://github.com/ferrocad/ferrocad).
+The grid is a single full-screen quad drawn by a WGSL shader: the fragment stage
+intersects each pixel's view ray with the z=0 plane and renders anti-aliased,
+level-of-detail-blended lines. There is no per-frame Python work: no camera
+sensor, no polling timer, no geometry rebuilds.
 
-An optional soft ground shadow is generated beneath visible document geometry,
-updated on demand from document events (never polled).
+This repository started as [makzumi's FreeCAD Grid
+Overlay](https://github.com/makzumi/freecad-grid-overlay) add-on and has been
+ported to the FerroCAD API. It is **FerroCAD-only**: it needs the Coin shader
+surface, the pull overlay bridge and the mod provider registry described below.
+It does not load on upstream FreeCAD. The original add-on remains the add-on for
+upstream FreeCAD; the GLSL shaders and the Qt dialog are gone from this tree.
 
-## Features
+## What it provides
 
-- **Procedural grid** — infinite z=0 grid rendered in GLSL, with automatic
-  level-of-detail blending between minor and major lines.
-- **Configurable appearance** — grid color, opacity, and base spacing scale.
-- **Optional ground shadow** — soft radial-falloff shadow beneath visible
-  geometry, with adjustable opacity.
-- **Pick-proof & unlit** — the overlay does not interfere with selection or
-  picking, and uses a base-color light model so it is unaffected by scene
-  lighting.
-- **Depth-safe** — the blended grid writes to the depth buffer with writes
-  disabled, so it never hides the shadow beneath it.
-- **Toolbar & settings dialog** — a **Grid Overlay** toolbar button opens the
-  settings dialog; the button persists across workbenches.
-- **Multi-document** — tracks open documents and attaches to the active 3D
-  view, including views opened after startup.
-
-## Installation
-
-Place the `GridOverlay` folder in your FreeCAD user `Mod` directory, then
-restart FreeCAD. The usual locations are:
-
-- **Windows:** `%APPDATA%\FreeCAD\Mod` (typically `C:\Users\<username>\AppData\Roaming\FreeCAD\Mod`)
-- **Linux:** `~/.local/share/FreeCAD/Mod`
-- **macOS:** `~/Library/Preferences/FreeCAD/Mod`
-
-Some FreeCAD builds use a version-specific user directory; in that case, use
-the `Mod` folder inside that directory.
-
-## Usage
-
-The **Grid Overlay** toolbar appears in the main window. Click the grid button
-to open **Settings**:
-
-| Setting              | Description                                              |
-| -------------------- | -------------------------------------------------------- |
-| Show custom grid     | Toggle the procedural grid overlay on/off.              |
-| Show ground shadow   | Toggle the optional soft shadow beneath geometry.       |
-| Ground shadow opacity| Opacity of the ground shadow.                            |
-| Base spacing scale   | Multiplier on the base grid spacing (0.1–100).           |
-| Opacity              | Overall grid opacity.                                    |
-| Grid color           | Color of the grid lines.                                 |
-
-The grid is shown automatically whenever a document is open and the overlay is
-enabled. It regenerates from the viewport's visible area as you navigate, and
-the shadow updates on geometry changes (debounced by 150 ms).
+- **A WGSL grid overlay** — infinite z=0 grid rendered on one quad, with
+  automatic level-of-detail blending between minor and major lines.
+- **An alternative backend, not a replacement** — the mod registers
+  `feature="grid"`, `backend="ferrocad-grid-overlay"` with FerroCAD's provider
+  registry at priority 0. FerroCAD's native (semantic) grid declares the same
+  feature at priority 10 and stays the default; `Mods_Settings` switches the
+  active backend. Only one grid draws at a time, and the inactive backend
+  refuses to draw or open its dialog.
+- **Six knobs** — show/hide, grid colour, opacity, base spacing scale, ground
+  shadow toggle and ground shadow opacity, with the original defaults.
+- **Pick-proof and unlit** — the overlay does not interfere with selection or
+  picking and uses a base-colour light model, so scene lighting does not affect
+  it.
+- **Depth-safe** — the blended grid tests the depth buffer with writes disabled,
+  so it never hides the shadow beneath it (or the model in front of it).
+- **Per-document** — one overlay per open document, attached on create/activate
+  and dropped on delete. Only the active document's grid is registered with the
+  viewport.
 
 ## Requirements
 
-- FreeCAD 26.x or 27.x (the current validation targets are 26.3 and 27.1)
-- FreeCAD's bundled PySide compatibility module, PySide2, or PySide6 for the
-  settings dialog
-- `pivy` (Coin3D) for the scene-graph nodes
+- A **FerroCAD** build that provides all of:
+  - the Coin shader nodes `SoShaderProgram`, `SoVertexShader`,
+    `SoFragmentShader`, `SoShaderParameter1f`/`3f`/`Array1f`, plus
+    `SoFaceSet`, `SoDepthBuffer`, `SoPickStyle` and `SoLightModel`;
+  - the pull overlay bridge `FreeCADGui.addOverlay(node)` /
+    `FreeCADGui.removeOverlay(node)`;
+  - the provider registry `FreeCADGui.registerProvider`,
+    `FreeCADGui.activeProvider` and `Mods_Settings`;
+  - `pivy.coin` and `FreeCAD.addDocumentObserver`.
+- No Qt is required (or imported).
 
-The add-on keeps its FreeCAD-facing code on APIs shared by 26.x and 27.x. At
-startup it detects the host release and warns if it is outside those validated
-major versions. Qt enum/button compatibility is handled for both Qt5-style and
-Qt6-style bindings, and the shader uses GLSL 1.20 compatibility syntax shared
-by the supported Coin3D viewport builds.
+If `addOverlay` is missing, the command reports that the build lacks the bridge
+instead of failing at import. If the provider registry is missing, the mod
+registers its command and still attaches the overlay as the only grid path.
 
-For release validation, install the same add-on revision in one FreeCAD 26.x
-build and one FreeCAD 27.x build, then verify startup with and without an open
-document, open a 3D view, toggle the grid, change each setting, recompute and
-move/hide geometry, switch documents, and close/reopen the application. Check
-the FreeCAD Python console for import, shader, or observer errors.
+## Installation
+
+Drop this directory into FerroCAD's `mods/` directory — the directory that sits
+next to FerroCAD's `python/` (a packaged install has both beside `AppRun`; a
+development checkout uses `mods/` in the repository root). The folder name is
+not significant; the module, its `Resources/` and its `InitGui.py` just have to
+be one directory.
+
+Restart FerroCAD. `InitGui.py` is executed by the workbench loader, registers
+`FerroCADGridOverlay_Settings`, and declares the grid provider.
+
+## Selecting the backend
+
+Open **Mods_Settings** and choose the grid backend:
+
+| Feature | Backend label | Where it comes from |
+| --- | --- | --- |
+| `grid` | Semantic (native) — the default | FerroCAD's built-in grid |
+| `grid` | **FerroCAD Grid Overlay (WGSL)** | this mod |
+
+The choice is persisted by FerroCAD under
+`User parameter:BaseApp/Preferences/Mods` → `Providers/grid`. Selecting this
+backend runs its `activate` (registers the overlay); switching away runs
+`deactivate` (removes it) and restores the native grid.
+
+The settings command is `FerroCADGridOverlay_Settings`
+(menu text **FerroCAD Grid Overlay (WGSL)**). It returns the standard dialog
+spec and, on accept, persists the values, rebuilds/re-registers the overlay and
+asks the shell to redraw it.
+
+| Setting | Description |
+| --- | --- |
+| Show custom grid | Toggle the procedural grid overlay on/off. |
+| Grid colour | `#RRGGBB` colour of the grid lines. |
+| Opacity | Overall grid opacity (0–1). |
+| Base spacing scale | Multiplier on the base grid spacing (0.01–100). |
+| Show ground shadow | Persisted; **does not draw yet** (see Limitations). |
+| Ground shadow opacity | Persisted; **does not draw yet**. |
+
+## How it differs from the upstream add-on
+
+| Upstream add-on | This mod |
+| --- | --- |
+| GLSL 1.20 `grid.vert.glsl` + `grid.frag.glsl` | One WGSL module, `Resources/grid_overlay.wgsl`, carried by the vertex stage |
+| `view.getSceneGraph()` and `sg.addChild(root)` | `FreeCADGui.addOverlay(root)` / `removeOverlay(root)` |
+| In-place uniform writes into a live graph | `_rebind()` after each change: rewrite the value-copied parameter nodes, rebuild the separator, remove and re-add the same root |
+| `QSettings` | `FreeCAD.ParamGet("User parameter:BaseApp/Preferences/Mod/FerroCADGridOverlay")` |
+| `QDialog` + `QSlider`/`QColorDialog` + private `QToolBar` | The shell's declarative six-field dialog spec |
+| `Gui.addDocumentObserver` + `QMdiArea`/`QTimer` | `FreeCAD.addDocumentObserver` (App-side create/activate/delete) |
+| FreeCAD 26.x/27.x | FerroCAD only |
+
+`Resources/grid_overlay.wgsl` is a **byte-identical** copy of FerroCAD's
+`crates/ferrocad_wgpu/shaders/grid_overlay.wgsl` (the reference copy). A mod
+ships loose files and cannot reach into the crate at runtime, so the duplicate is
+deliberate; keep them in sync when the reference changes. Colour tokens are
+decoded from sRGB to linear light because FerroCAD's render target is sRGB.
+
+## Limitations
+
+- **Ground shadows are deferred.** The `shadow_count`, `shadow_opacity` and
+  `shadow_data` parameters and the shader's 80-slot block are compiled, and both
+  shadow knobs persist, but no document-bounds producer is wired yet, so
+  `shadow_count` is always 0 and nothing draws. This is the upstream parameter
+  set without the upstream footprint scan.
+- **No Qt.** There is no toolbar, no `QDialog` and no colour picker; the command
+  uses FerroCAD's dialog protocol, so the colour is a hex text field.
+- **FerroCAD only.** The WGSL source text, `addOverlay`, `activeProvider` and
+  the dialog spec do not exist on upstream FreeCAD. Install the original add-on
+  there instead.
+- **Settings are in-memory today.** FerroCAD's `ParamGet` is a stand-in without
+  cross-session persistence; the mod uses the documented API and gains
+  persistence when the parameter backend does.
+- **A parameter change re-registers the whole tree.** That is the pull bridge's
+  contract, not an oversight; the tree is six nodes.
+
+## Development
+
+The port is covered by a self-contained suite that needs neither FerroCAD nor a
+GPU: it installs fake `FreeCAD`, `FreeCADGui` and `pivy.coin` modules, loads
+`InitGui.py` by path and checks the dialog shape, the overlay add/remove/rebind
+calls and the provider declaration.
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+See `tests/README.md` for the manual integration run against a real FerroCAD
+build.
 
 ## License
 
-See the project license file for details.
+MIT — see `LICENSE`. Copyright (c) 2026 [makzumi](https://github.com/makzumi),
+the author of the original FreeCAD add-on; `Resources/grid.svg` and
+`Resources/Media/demo.png` come from that add-on.
