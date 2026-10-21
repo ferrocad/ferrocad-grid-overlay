@@ -21,6 +21,13 @@ dialog spec (``{"title", "accept", "fields", "on_accept"}``), settings live in
 ``FreeCAD.addDocumentObserver``. The upstream toolbar does not exist here; the
 command is opened from the shell's command list or its settings dialog.
 
+The mod declares itself as the ``"ferrocad-grid-overlay"`` backend of the
+``"grid"`` feature (priority 0). FerroCAD's native grid declares the same feature
+as ``"semantic"``, so this is an alternative backend rather than a replacement:
+``Mods_Settings`` switches them, and the inactive backend neither draws nor runs
+its command. Registration lives in :func:`register_provider` so a registry reset
+can restore it without reloading the module.
+
 Ground shadows are deferred: the ``shadow_count``/``shadow_opacity`` parameters
 and the 80-slot ABI block are kept, the knobs persist, but ``shadow_count`` is
 always 0 because no document-bounds producer is wired yet.
@@ -59,6 +66,12 @@ DEFAULTS = {
 SETTINGS = App.ParamGet("User parameter:BaseApp/Preferences/Mod/FerroCADGridOverlay")
 
 COMMAND = "FerroCADGridOverlay_Settings"
+
+#: The provider feature this mod provides, and its backend id. FerroCAD's native
+#: grid declares the same feature as ``"semantic"`` (priority 10); this mod is
+#: the selectable alternative. See ``docs/mod-providers.md`` in FerroCAD.
+FEATURE = "grid"
+BACKEND = "ferrocad-grid-overlay"
 
 UPSTREAM_STATUS = (
     "FerroCAD Grid Overlay (WGSL) needs FerroCAD's pull overlay bridge "
@@ -102,6 +115,30 @@ def overlay_api():
     if getattr(Gui, "removeOverlay", None) is None:
         return None
     return Gui
+
+
+def is_active():
+    """Whether this backend owns the grid feature.
+
+    ``True`` when the facade has no provider registry (an older FerroCAD build)
+    or the feature has no registered provider: the mod is then the only grid
+    path. ``activeProvider`` is FerroCAD's registry accessor.
+    """
+    active_provider = getattr(Gui, "activeProvider", None)
+    if active_provider is None:
+        return True
+    return active_provider(FEATURE) in (None, BACKEND)
+
+
+def inactive_status():
+    """The one-line reason ``Activated``/``on_accept`` refuse to run."""
+    active_provider = getattr(Gui, "activeProvider", None)
+    active = active_provider(FEATURE) if active_provider is not None else None
+    return (
+        "FerroCAD Grid Overlay (WGSL) is not the active grid provider (%s is "
+        "active). Use Mods_Settings to switch backends."
+        % (active or "another backend")
+    )
 
 
 def _field(name, label, kind, value, **extra):
@@ -402,7 +439,13 @@ class GridManager:
             pass
 
     def ensure_grid(self):
-        """Create the active document's grid when enabled, then bind it."""
+        """Create the active document's grid when enabled, then bind it.
+
+        When another backend owns the feature (or the registry has not loaded
+        yet), this is a no-op: only one grid backend draws at a time.
+        """
+        if not is_active():
+            return
         doc = getattr(App, "ActiveDocument", None)
         if doc is None:
             return
@@ -459,8 +502,11 @@ def apply_dialog(values):
 
     The returned ``{"view": {...}}`` is what triggers the shell to pull the
     re-registered overlay. The flag only hides the native ground: a registered
-    overlay is drawn whether or not it is set.
+    overlay is drawn whether or not it is set. A stale dialog from a backend
+    that was switched away leaves the store alone and reports why.
     """
+    if not is_active():
+        return {"status": inactive_status()}
     # Validate before persisting, so a bad colour leaves the store alone.
     if "color" in values:
         color_to_linear(values["color"])
@@ -487,6 +533,8 @@ class FerroCADGridOverlayCommand:
         return True
 
     def Activated(self):
+        if not is_active():
+            return {"status": inactive_status()}
         if coin is None:
             return {
                 "status": "FerroCAD Grid Overlay (WGSL) needs the Coin facade "
@@ -557,3 +605,39 @@ Gui.addCommand(COMMAND, FerroCADGridOverlayCommand())
 # Attach on startup when a document is already open; otherwise wait for one.
 if coin is not None and setting("enabled") and getattr(App, "ActiveDocument", None):
     manager.ensure_grid()
+
+
+def activate():
+    """Register the overlay for the active document (a provider switch)."""
+    manager.ensure_grid()
+
+
+def deactivate():
+    """Detach every overlay this mod registered; idempotent by design."""
+    manager.remove_grid()
+
+
+def register_provider():
+    """Declare the backend with FerroCAD's provider registry.
+
+    Re-callable, so a test or a registry reset can restore the declaration. On a
+    build without the registry (``registerProvider`` absent) this returns
+    ``False`` and the mod still works as the only grid path. Registration only
+    records the manifest; FerroCAD runs ``activate`` on the first switch.
+    """
+    register = getattr(Gui, "registerProvider", None)
+    if register is None:
+        return False
+    register(
+        FEATURE,
+        BACKEND,
+        "FerroCAD Grid Overlay (WGSL)",
+        command=COMMAND,
+        priority=0,
+        activate=activate,
+        deactivate=deactivate,
+    )
+    return True
+
+
+register_provider()
