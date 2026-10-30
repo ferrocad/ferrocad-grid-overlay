@@ -147,3 +147,17 @@ build.
 MIT — see `LICENSE`. Copyright (c) 2026 [makzumi](https://github.com/makzumi),
 the author of the original FreeCAD add-on; `Resources/grid.svg` and
 `Resources/Media/demo.png` come from that add-on.
+
+## Shared grid settings
+
+The shader reads the host's resolved grid from the frame: the effective minor and
+major steps, the patch radius, the minor level's form (intersection dots or a line
+lattice), the two stroke widths in the plane's units and each level's base ink.
+When the running build provides `FerroCAD.Grid`, that store decides what is drawn
+and this mod's *opacity* and *base spacing scale* rows are the fallback a build
+without those claims would use — the native grid and this overlay then draw the
+same lattice, at the same weight, over the same patch.
+
+`Resources/grid_overlay.wgsl` is a byte-identical copy of the reference shader in
+the FerroCAD tree (`mods/GridOverlayCoin/Resources/grid_overlay.wgsl`); re-sync it
+whenever that one changes.
